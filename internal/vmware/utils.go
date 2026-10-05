@@ -7,6 +7,7 @@ import (
 	"github.com/vmware/govmomi/performance"
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
+	"strconv"
 	"strings"
 	"vmware-exporter/pkg/logging"
 )
@@ -99,62 +100,76 @@ func maintenanceMode(s bool) float64 {
 	return 0
 }
 
-// perfBatchSize limits the number of VMs in one QueryPerf request: a single request for every VM
+// perfBatchSize limits the number of entities in one QueryPerf request: a single request for every VM
 // of a big vCenter may exceed the scrape timeout or the server limits.
 const perfBatchSize = 100
 
-// perfMon returns performance counters per VM (key is the VM managed object id).
-// A failed batch is logged and skipped, the other batches are still collected.
-func perfMon(ctx context.Context, c *govmomi.Client, vms []types.ManagedObjectReference, l *logging.Logger) (map[string][]vmMetric, error) {
-	if len(vms) == 0 {
-		return nil, nil
-	}
+type perfClient struct {
+	manager  *performance.Manager
+	counters map[string]*types.PerfCounterInfo
+	logger   *logging.Logger
+}
 
-	// Create a PerfManager
-	perfManager := performance.NewManager(c.Client)
-
-	// Retrieve counters name list
-	counters, err := perfManager.CounterInfoByName(ctx)
+func newPerfClient(ctx context.Context, c *govmomi.Client, l *logging.Logger) (*perfClient, error) {
+	manager := performance.NewManager(c.Client)
+	counters, err := manager.CounterInfoByName(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("counter info: %w", err)
 	}
+	return &perfClient{manager: manager, counters: counters, logger: l}, nil
+}
 
-	names := make([]string, 0, len(counters))
-	for name := range counters {
+// allCounters returns the names of every counter known to the server.
+func (p *perfClient) allCounters() []string {
+	names := make([]string, 0, len(p.counters))
+	for name := range p.counters {
 		names = append(names, name)
 	}
+	return names
+}
 
-	// Create PerfQuerySpec
+// query returns the last real-time sample of the counters per entity (key is the managed object id).
+// instance is "" for the aggregated value or "*" for every instance (NIC, datastore, ...).
+// Counters unknown to the server are skipped; a failed batch is logged and the other batches still run.
+func (p *perfClient) query(ctx context.Context, refs []types.ManagedObjectReference, names []string, instance string) (map[string][]vmMetric, error) {
+	known := make([]string, 0, len(names))
+	for _, n := range names {
+		if _, ok := p.counters[n]; ok {
+			known = append(known, n)
+		}
+	}
+	if len(refs) == 0 || len(known) == 0 {
+		return nil, nil
+	}
+
 	spec := types.PerfQuerySpec{
 		MaxSample:  1,
-		MetricId:   []types.PerfMetricId{{Instance: ""}},
+		MetricId:   []types.PerfMetricId{{Instance: instance}},
 		IntervalId: int32(interval),
 	}
 
 	metricsRes := make(map[string][]vmMetric)
-	for start := 0; start < len(vms); start += perfBatchSize {
+	for start := 0; start < len(refs); start += perfBatchSize {
 		end := start + perfBatchSize
-		if end > len(vms) {
-			end = len(vms)
+		if end > len(refs) {
+			end = len(refs)
 		}
 		if ctx.Err() != nil {
 			return metricsRes, ctx.Err()
 		}
 
-		// Query metrics
-		sample, err := perfManager.SampleByName(ctx, spec, names, vms[start:end])
+		sample, err := p.manager.SampleByName(ctx, spec, known, refs[start:end])
 		if err != nil {
-			l.Error(fmt.Sprintf("perf sample of VMs %d-%d failed: %v", start, end, err))
+			p.logger.Error(fmt.Sprintf("perf sample of entities %d-%d failed: %v", start, end, err))
 			continue
 		}
-		result, err := perfManager.ToMetricSeries(ctx, sample)
+		result, err := p.manager.ToMetricSeries(ctx, sample)
 		if err != nil {
-			l.Error(fmt.Sprintf("perf metric series of VMs %d-%d failed: %v", start, end, err))
+			p.logger.Error(fmt.Sprintf("perf metric series of entities %d-%d failed: %v", start, end, err))
 			continue
 		}
 
 		for _, metric := range result {
-			var vmMetrics []vmMetric
 			for _, v := range metric.Value {
 				if len(v.Value) == 0 {
 					continue
@@ -164,18 +179,38 @@ func perfMon(ctx context.Context, c *govmomi.Client, vms []types.ManagedObjectRe
 					instance = "-"
 				}
 				var unit string
-				if ci, ok := counters[v.Name]; ok && ci.UnitInfo != nil {
+				if ci, ok := p.counters[v.Name]; ok && ci.UnitInfo != nil {
 					unit = ci.UnitInfo.GetElementDescription().Label
 				}
-				vmMetrics = append(vmMetrics, vmMetric{
+				metricsRes[metric.Entity.Value] = append(metricsRes[metric.Entity.Value], vmMetric{
 					Instance:    instance,
 					MetricName:  v.Name,
 					MetricValue: v.ValueCSV(),
 					MetricUnit:  unit,
 				})
 			}
-			metricsRes[metric.Entity.Value] = vmMetrics
 		}
 	}
 	return metricsRes, nil
+}
+
+// instanceSamples converts instanced metrics to samples; the aggregated value ("-") is skipped
+// because the aggregates are exported as separate metrics. resolve may rename an instance.
+func instanceSamples(metrics []vmMetric, resolve map[string]string) []perfSample {
+	var res []perfSample
+	for _, m := range metrics {
+		if m.Instance == "-" {
+			continue
+		}
+		v, err := strconv.ParseFloat(m.MetricValue, 64)
+		if err != nil {
+			continue
+		}
+		inst := m.Instance
+		if name, ok := resolve[inst]; ok {
+			inst = name
+		}
+		res = append(res, perfSample{Counter: m.MetricName, Instance: inst, Value: v})
+	}
+	return res
 }

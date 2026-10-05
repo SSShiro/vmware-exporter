@@ -9,6 +9,7 @@ import (
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
 	"math"
+	"path"
 	"reflect"
 	"runtime/debug"
 	"strconv"
@@ -89,6 +90,24 @@ func (s *service) error(err error) {
 	s.logger.Error(err.Error())
 }
 
+// scrapeData is the inventory-wide data shared by the per-host collection.
+type scrapeData struct {
+	dsNames      map[string]string // datastore moref -> name
+	dsInstances  map[string]string // datastore uuid (perf counter instance) -> name
+	hostCluster  map[string]string // host moref -> cluster name
+	vmPerf       map[string][]vmMetric
+	vmDSPerf     map[string][]vmMetric
+	hostPerf     map[string][]vmMetric
+	hostInstPerf map[string][]vmMetric
+}
+
+func (s *service) perfOrLog(m map[string][]vmMetric, err error) map[string][]vmMetric {
+	if err != nil {
+		s.logger.Error(fmt.Sprintf("collect performance metrics from %s failed: %v", s.vmwareHost, err))
+	}
+	return m
+}
+
 // maxHostWorkers limits parallel per-host requests so a big vCenter is not flooded.
 const maxHostWorkers = 8
 
@@ -127,7 +146,7 @@ func (s *service) statuses() ([]*Status, error) {
 	}
 
 	var vms []mo.VirtualMachine
-	if err := retrieveView(ctx, m, root, "VirtualMachine", []string{"summary"}, &vms); err != nil {
+	if err := retrieveView(ctx, m, root, "VirtualMachine", []string{"summary", "snapshot", "storage"}, &vms); err != nil {
 		return nil, fmt.Errorf("retrieve VirtualMachine: %w", err)
 	}
 
@@ -153,8 +172,22 @@ func (s *service) statuses() ([]*Status, error) {
 		dsSeen[[2]string{host, ds}] = struct{}{}
 		dsByHost[host] = append(dsByHost[host], item)
 	}
+	dsNames := make(map[string]string, len(dss))     // datastore moref -> name
+	dsInstances := make(map[string]string, len(dss)) // datastore uuid (perf counter instance) -> name
 	for _, ds := range dss {
-		dsInfo[ds.Self.Value] = totalds{ds.Summary.Name, float64(ds.Summary.Capacity), float64(ds.Summary.FreeSpace)}
+		dsInfo[ds.Self.Value] = totalds{
+			dsname:      ds.Summary.Name,
+			capacity:    float64(ds.Summary.Capacity),
+			freespace:   float64(ds.Summary.FreeSpace),
+			uncommitted: float64(ds.Summary.Uncommitted),
+			dsType:      ds.Summary.Type,
+			url:         ds.Summary.Url,
+			accessible:  ds.Summary.Accessible,
+		}
+		dsNames[ds.Self.Value] = ds.Summary.Name
+		if uuid := path.Base(strings.TrimRight(ds.Summary.Url, "/")); uuid != "." && uuid != "/" {
+			dsInstances[uuid] = ds.Summary.Name
+		}
 	}
 	for _, ds := range dss {
 		for _, mount := range ds.Host {
@@ -167,10 +200,34 @@ func (s *service) statuses() ([]*Status, error) {
 		}
 	}
 
-	// perf counters are optional: a failure must not drop all the other metrics
-	vmPerfMetrics, err := perfMon(ctx, c, vmsRefs, s.logger)
-	if err != nil {
-		s.logger.Error(fmt.Sprintf("collect VM performance metrics from %s failed: %v", s.vmwareHost, err))
+	// clusters are optional (a standalone host has none): a failure only drops the cluster label
+	hostCluster := make(map[string]string)
+	var clusters []mo.ClusterComputeResource
+	if err := retrieveView(ctx, m, root, "ClusterComputeResource", []string{"name", "host"}, &clusters); err != nil {
+		s.logger.Error(fmt.Sprintf("retrieve ClusterComputeResource from %s failed: %v", s.vmwareHost, err))
+	}
+	for _, cl := range clusters {
+		for _, h := range cl.Host {
+			hostCluster[h.Value] = cl.Name
+		}
+	}
+
+	// performance counters are optional: a failure must not drop all the other metrics
+	data := &scrapeData{dsNames: dsNames, dsInstances: dsInstances, hostCluster: hostCluster}
+	if pc, err := newPerfClient(ctx, c, s.logger); err != nil {
+		s.logger.Error(fmt.Sprintf("collect performance metrics from %s failed: %v", s.vmwareHost, err))
+	} else {
+		var hostRefs []types.ManagedObjectReference
+		for _, h := range hss {
+			if h.Summary.Runtime != nil && h.Summary.Runtime.ConnectionState == types.HostSystemConnectionStateConnected &&
+				h.Summary.Runtime.PowerState == types.HostSystemPowerStatePoweredOn {
+				hostRefs = append(hostRefs, h.Self)
+			}
+		}
+		data.vmPerf = s.perfOrLog(pc.query(ctx, vmsRefs, pc.allCounters(), ""))
+		data.vmDSPerf = s.perfOrLog(pc.query(ctx, vmsRefs, vmInstancedCounters, "*"))
+		data.hostPerf = s.perfOrLog(pc.query(ctx, hostRefs, hostCounters, ""))
+		data.hostInstPerf = s.perfOrLog(pc.query(ctx, hostRefs, hostInstancedCounters, "*"))
 	}
 
 	result := make([]*Status, len(hss))
@@ -189,7 +246,7 @@ func (s *service) statuses() ([]*Status, error) {
 				}
 			}()
 			h := hss[i]
-			result[i] = s.hostStatus(ctx, c.Client, &h, dsByHost[h.Self.Value], vmsByHost[h.Self.Value], vmPerfMetrics)
+			result[i] = s.hostStatus(ctx, c.Client, &h, dsByHost[h.Self.Value], vmsByHost[h.Self.Value], data)
 		}(i)
 	}
 	wg.Wait()
@@ -203,12 +260,15 @@ func (s *service) statuses() ([]*Status, error) {
 	if len(statuses) == 0 {
 		return nil, fmt.Errorf("no host of %s could be collected", s.vmwareHost)
 	}
+	if about := c.ServiceContent.About; about.ApiType == "VirtualCenter" {
+		statuses[0].VCenter = &vcenterInfo{Version: about.Version, Build: about.Build, Patch: about.PatchLevel, FullName: about.FullName, ApiType: about.ApiType}
+	}
 	return statuses, nil
 }
 
 // hostStatus builds the Status of one host. Details that can not be read (e.g. the host is
 // disconnected) are skipped and logged, the rest of the metrics is still reported.
-func (s *service) hostStatus(ctx context.Context, c *vim25.Client, h *mo.HostSystem, dss []totalds, vms []mo.VirtualMachine, perf map[string][]vmMetric) *Status {
+func (s *service) hostStatus(ctx context.Context, c *vim25.Client, h *mo.HostSystem, dss []totalds, vms []mo.VirtualMachine, data *scrapeData) *Status {
 	status := Status{
 		DiskOk:           []diskOk{},
 		NetworkPNICSpeed: []pnic{},
@@ -216,6 +276,13 @@ func (s *service) hostStatus(ctx context.Context, c *vim25.Client, h *mo.HostSys
 		StorageInfo:      []StorageStateInfo{},
 		DS:               dss,
 		VMS:              []hvms{},
+		HostCluster:      data.hostCluster[h.Self.Value],
+		HostPerf:         instanceSamples(data.hostInstPerf[h.Self.Value], data.dsInstances),
+	}
+	for _, m := range data.hostPerf[h.Self.Value] {
+		if v, err := strconv.ParseFloat(m.MetricValue, 64); err == nil && m.Instance == "-" {
+			status.HostPerf = append(status.HostPerf, perfSample{Counter: m.MetricName, Value: v})
+		}
 	}
 
 	sum := h.Summary
@@ -259,6 +326,9 @@ func (s *service) hostStatus(ctx context.Context, c *vim25.Client, h *mo.HostSys
 			status.HostBoot = float64(rt.BootTime.Unix())
 		}
 		connected = rt.ConnectionState == types.HostSystemConnectionStateConnected
+		if connected {
+			status.HostConnected = 1
+		}
 		// health data is optional: the host may not report it (monitoring service down, disconnected, etc.)
 		if hsr := rt.HealthSystemRuntime; hsr != nil {
 			if hsr.SystemHealthInfo != nil {
@@ -296,7 +366,7 @@ func (s *service) hostStatus(ctx context.Context, c *vim25.Client, h *mo.HostSys
 	// VM names are unique only per folder in vCenter, while a duplicated label set fails the whole scrape
 	seen := make(map[string]struct{}, len(vms))
 	for _, vm := range vms {
-		st := vmStatus(vm, perf[vm.Self.Value])
+		st := vmStatus(vm, data.vmPerf[vm.Self.Value], data.vmDSPerf[vm.Self.Value], data.dsNames, data.dsInstances)
 		if _, dup := seen[st.VmName]; dup {
 			st.VmName = fmt.Sprintf("%s (%s)", st.VmName, vm.Self.Value)
 		}
@@ -356,7 +426,7 @@ func (s *service) hostDevices(ctx context.Context, c *vim25.Client, h *mo.HostSy
 
 // vmStatus converts a VM summary and its performance counters; Guest and Storage may be absent
 // (powered off, inaccessible or orphaned VMs).
-func vmStatus(vm mo.VirtualMachine, perfMetrics []vmMetric) hvms {
+func vmStatus(vm mo.VirtualMachine, perfMetrics, dsPerf []vmMetric, dsNames, dsInstances map[string]string) hvms {
 	var vmPerfRes vmPerf
 	r := reflect.ValueOf(&vmPerfRes).Elem()
 	for _, v := range perfMetrics {
@@ -380,6 +450,20 @@ func vmStatus(vm mo.VirtualMachine, perfMetrics []vmMetric) hvms {
 		VmMemAval:    float64(vm.Summary.Config.MemorySizeMB),
 		VmMemUsage:   float64(vm.Summary.QuickStats.HostMemoryUsage),
 		Perf:         vmPerfRes,
+		DSPerf:       instanceSamples(dsPerf, dsInstances),
+	}
+	if vm.Snapshot != nil {
+		res.Snapshots = flattenSnapshots(vm.Snapshot.RootSnapshotList, nil)
+		res.SnapshotCount = float64(len(res.Snapshots))
+	}
+	if vm.Storage != nil {
+		for _, u := range vm.Storage.PerDatastoreUsage {
+			name := dsNames[u.Datastore.Value]
+			if name == "" {
+				name = u.Datastore.Value
+			}
+			res.DSUsage = append(res.DSUsage, vmDSUsage{name, float64(u.Committed), float64(u.Uncommitted), float64(u.Unshared)})
+		}
 	}
 	if g := vm.Summary.Guest; g != nil {
 		res.VmGuestId = g.GuestId
@@ -393,6 +477,15 @@ func vmStatus(vm mo.VirtualMachine, perfMetrics []vmMetric) hvms {
 		res.VmGuestStorageUnCommitted = float64(st.Uncommitted)
 	}
 	return res
+}
+
+// flattenSnapshots returns all snapshots of the (nested) snapshot tree.
+func flattenSnapshots(tree []types.VirtualMachineSnapshotTree, acc []snapshotInfo) []snapshotInfo {
+	for _, sn := range tree {
+		acc = append(acc, snapshotInfo{Name: sn.Name, Id: sn.Id, Created: float64(sn.CreateTime.Unix())})
+		acc = flattenSnapshots(sn.ChildSnapshotList, acc)
+	}
+	return acc
 }
 
 // retrieveView loads properties of all objects of the given type and always destroys the view,

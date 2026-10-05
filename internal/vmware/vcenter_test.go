@@ -82,6 +82,25 @@ func TestVCenterReportsAllHosts(t *testing.T) {
 	if hostSeries != len(statuses) {
 		t.Fatalf("host_power_state series=%d, hosts=%d", hostSeries, len(statuses))
 	}
+	count := func(name string) int {
+		for _, mf := range mfs {
+			if mf.GetName() == name {
+				return len(mf.GetMetric())
+			}
+		}
+		return 0
+	}
+	if n := count("vmware_exporter_vcenter_info"); n != 1 {
+		t.Errorf("vcenter_info must be exported once, got %d", n)
+	}
+	if n := count("vmware_exporter_host_cluster_info"); n != 6 { // 2 clusters x 3 hosts, the standalone host has none
+		t.Errorf("host_cluster_info series=%d, want 6", n)
+	}
+	for _, name := range []string{"host_connected", "datastore_info", "datastore_accessible", "datastore_provisioned_size", "vm_snapshot_count"} {
+		if count("vmware_exporter_"+name) == 0 {
+			t.Errorf("metric %s is missing", name)
+		}
+	}
 	if n, err := testutil.GatherAndCount(reg); err != nil || n == 0 {
 		t.Fatalf("count=%d err=%v", n, err)
 	}

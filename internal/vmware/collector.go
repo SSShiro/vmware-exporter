@@ -8,6 +8,7 @@ import (
 
 type Collector struct {
 	ss                        Service
+	extra                     *extraDescs
 	HostPowerState            *prometheus.Desc
 	HostMaintenanceMode       *prometheus.Desc
 	HostBoot                  *prometheus.Desc
@@ -192,7 +193,8 @@ var _ prometheus.Collector = &Collector{}
 // New Create A new VMWare collector
 func NewCollector(ss Service) *Collector {
 	return &Collector{
-		ss: ss,
+		ss:    ss,
+		extra: newExtraDescs(),
 		HostPowerState: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "host", "power_state"),
 			"poweredOn 1, poweredOff 2, standBy 3, other 0",
@@ -1436,6 +1438,7 @@ func (c Collector) Describe(descs chan<- *prometheus.Desc) {
 	for _, d := range ds {
 		descs <- d
 	}
+	c.extra.describe(descs)
 }
 
 func (c Collector) Collect(ch chan<- prometheus.Metric) {
@@ -1466,6 +1469,8 @@ func (c Collector) Collect(ch chan<- prometheus.Metric) {
 }
 
 func (c Collector) collectHost(ch chan<- prometheus.Metric, s *Status) {
+	c.extra.collect(ch, s)
+
 	ch <- prometheus.MustNewConstMetric(
 		c.HostPowerState,
 		prometheus.GaugeValue,
