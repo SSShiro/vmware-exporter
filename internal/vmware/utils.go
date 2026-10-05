@@ -214,3 +214,53 @@ func instanceSamples(metrics []vmMetric, resolve map[string]string) []perfSample
 	}
 	return res
 }
+
+// alarmCounts returns the number of red and yellow triggered alarms of an entity.
+func alarmCounts(states []types.AlarmState) (red, yellow float64) {
+	for _, st := range states {
+		switch st.OverallStatus {
+		case types.ManagedEntityStatusRed:
+			red++
+		case types.ManagedEntityStatusYellow:
+			yellow++
+		}
+	}
+	return red, yellow
+}
+
+func datastoreMaintenanceMode(s string) float64 {
+	switch s {
+	case "enteringMaintenance":
+		return 1
+	case "inMaintenance":
+		return 2
+	}
+	return 0
+}
+
+func standbyMode(s string) float64 {
+	switch s {
+	case "entering":
+		return 1
+	case "in":
+		return 2
+	case "exiting":
+		return 3
+	}
+	return 0
+}
+
+// dedupSensors drops sensors with an identical label set: a duplicated series fails the whole scrape.
+func dedupSensors(in []NumericSensorInfo) []NumericSensorInfo {
+	seen := make(map[[6]string]struct{}, len(in))
+	out := make([]NumericSensorInfo, 0, len(in))
+	for _, s := range in {
+		key := [6]string{s.Name, s.CurrentReading, s.BaseUnits, s.SensorType, s.Id, s.SensorNumber}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}

@@ -133,7 +133,7 @@ func (s *service) statuses() ([]*Status, error) {
 	root := c.ServiceContent.RootFolder
 
 	var hss []mo.HostSystem
-	if err := retrieveView(ctx, m, root, "HostSystem", []string{"summary", "datastore"}, &hss); err != nil {
+	if err := retrieveView(ctx, m, root, "HostSystem", []string{"summary", "datastore", "triggeredAlarmState"}, &hss); err != nil {
 		return nil, fmt.Errorf("retrieve HostSystem: %w", err)
 	}
 	if len(hss) == 0 {
@@ -141,12 +141,12 @@ func (s *service) statuses() ([]*Status, error) {
 	}
 
 	var dss []mo.Datastore
-	if err := retrieveView(ctx, m, root, "Datastore", []string{"summary", "host"}, &dss); err != nil {
+	if err := retrieveView(ctx, m, root, "Datastore", []string{"summary", "host", "vm", "triggeredAlarmState"}, &dss); err != nil {
 		return nil, fmt.Errorf("retrieve Datastore: %w", err)
 	}
 
 	var vms []mo.VirtualMachine
-	if err := retrieveView(ctx, m, root, "VirtualMachine", []string{"summary", "snapshot", "storage"}, &vms); err != nil {
+	if err := retrieveView(ctx, m, root, "VirtualMachine", []string{"summary", "snapshot", "storage", "guest.disk", "triggeredAlarmState"}, &vms); err != nil {
 		return nil, fmt.Errorf("retrieve VirtualMachine: %w", err)
 	}
 
@@ -164,6 +164,7 @@ func (s *service) statuses() ([]*Status, error) {
 	dsInfo := make(map[string]totalds, len(dss))
 	dsByHost := make(map[string][]totalds)
 	dsSeen := make(map[[2]string]struct{})
+	dsHosts := make(map[string]float64) // number of hosts a datastore is mounted on
 	addDS := func(host, ds string) {
 		item, ok := dsInfo[ds]
 		if _, dup := dsSeen[[2]string{host, ds}]; !ok || dup {
@@ -171,11 +172,13 @@ func (s *service) statuses() ([]*Status, error) {
 		}
 		dsSeen[[2]string{host, ds}] = struct{}{}
 		dsByHost[host] = append(dsByHost[host], item)
+		dsHosts[ds]++
 	}
 	dsNames := make(map[string]string, len(dss))     // datastore moref -> name
 	dsInstances := make(map[string]string, len(dss)) // datastore uuid (perf counter instance) -> name
 	for _, ds := range dss {
 		dsInfo[ds.Self.Value] = totalds{
+			ref:         ds.Self.Value,
 			dsname:      ds.Summary.Name,
 			capacity:    float64(ds.Summary.Capacity),
 			freespace:   float64(ds.Summary.FreeSpace),
@@ -183,7 +186,12 @@ func (s *service) statuses() ([]*Status, error) {
 			dsType:      ds.Summary.Type,
 			url:         ds.Summary.Url,
 			accessible:  ds.Summary.Accessible,
+			maintenance: datastoreMaintenanceMode(ds.Summary.MaintenanceMode),
+			vms:         float64(len(ds.Vm)),
 		}
+		item := dsInfo[ds.Self.Value]
+		item.redAlarms, item.yellowAlarms = alarmCounts(ds.TriggeredAlarmState)
+		dsInfo[ds.Self.Value] = item
 		dsNames[ds.Self.Value] = ds.Summary.Name
 		if uuid := path.Base(strings.TrimRight(ds.Summary.Url, "/")); uuid != "." && uuid != "/" {
 			dsInstances[uuid] = ds.Summary.Name
@@ -198,6 +206,13 @@ func (s *service) statuses() ([]*Status, error) {
 		for _, ref := range h.Datastore {
 			addDS(h.Self.Value, ref.Value)
 		}
+	}
+
+	for host, list := range dsByHost {
+		for i := range list {
+			list[i].hosts = dsHosts[list[i].ref]
+		}
+		dsByHost[host] = list
 	}
 
 	// clusters are optional (a standalone host has none): a failure only drops the cluster label
@@ -318,10 +333,13 @@ func (s *service) hostStatus(ctx context.Context, c *vim25.Client, h *mo.HostSys
 	status.UsageCpu = float64(sum.QuickStats.OverallCpuUsage)
 	status.UsageMem = float64(sum.QuickStats.OverallMemoryUsage) * 1024 * 1024
 
+	status.HostRedAlarms, status.HostYellowAlarms = alarmCounts(h.TriggeredAlarmState)
+
 	connected := true
 	if rt := sum.Runtime; rt != nil {
 		status.HostPowerState = powerState(rt.PowerState)
 		status.HostMaintenanceMode = maintenanceMode(rt.InMaintenanceMode)
+		status.HostStandbyMode = standbyMode(rt.StandbyMode)
 		if rt.BootTime != nil {
 			status.HostBoot = float64(rt.BootTime.Unix())
 		}
@@ -333,10 +351,12 @@ func (s *service) hostStatus(ctx context.Context, c *vim25.Client, h *mo.HostSys
 		if hsr := rt.HealthSystemRuntime; hsr != nil {
 			if hsr.SystemHealthInfo != nil {
 				for _, sensor := range hsr.SystemHealthInfo.NumericSensorInfo {
+					value := float64(sensor.CurrentReading) * math.Pow(10, float64(sensor.UnitModifier))
 					status.SensorInfo = append(status.SensorInfo, NumericSensorInfo{
 						Name:           sensor.Name,
 						HealthState:    sensorHealthOf(sensor.HealthState),
-						CurrentReading: strconv.Itoa(int(float64(sensor.CurrentReading) * math.Pow(10, float64(sensor.UnitModifier)))),
+						Value:          value,
+						CurrentReading: strconv.Itoa(int(value)),
 						BaseUnits:      sensor.BaseUnits,
 						SensorType:     sensor.SensorType,
 						Id:             sensor.Id,
@@ -465,7 +485,20 @@ func vmStatus(vm mo.VirtualMachine, perfMetrics, dsPerf []vmMetric, dsNames, dsI
 			res.DSUsage = append(res.DSUsage, vmDSUsage{name, float64(u.Committed), float64(u.Uncommitted), float64(u.Unshared)})
 		}
 	}
+	res.RedAlarms, res.YellowAlarms = alarmCounts(vm.TriggeredAlarmState)
+	res.Template = boolValue(vm.Summary.Config.Template)
+	if vm.Guest != nil {
+		seen := make(map[string]struct{}, len(vm.Guest.Disk))
+		for _, d := range vm.Guest.Disk {
+			if _, dup := seen[d.DiskPath]; dup {
+				continue
+			}
+			seen[d.DiskPath] = struct{}{}
+			res.GuestDisks = append(res.GuestDisks, guestDisk{d.DiskPath, float64(d.Capacity), float64(d.FreeSpace)})
+		}
+	}
 	if g := vm.Summary.Guest; g != nil {
+		res.GuestToolsRunning = boolValue(g.ToolsRunningStatus == string(types.VirtualMachineToolsRunningStatusGuestToolsRunning))
 		res.VmGuestId = g.GuestId
 		res.VmGuestToolsStatus = guestToolsStatus(string(g.ToolsStatus))
 		res.VmGuestToolsVersion = guestToolsVersion(g.ToolsVersionStatus)

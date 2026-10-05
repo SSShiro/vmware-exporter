@@ -23,6 +23,11 @@ type totalds struct {
 	uncommitted         float64
 	dsType, url         string
 	accessible          bool
+	maintenance         float64 // normal 0, enteringMaintenance 1, inMaintenance 2
+	vms, hosts          float64
+	ref                 string // datastore moref
+	redAlarms           float64
+	yellowAlarms        float64
 }
 
 // perfSample is one value of an instanced performance counter (per NIC, per datastore, ...).
@@ -30,6 +35,11 @@ type perfSample struct {
 	Counter  string
 	Instance string
 	Value    float64
+}
+
+type guestDisk struct {
+	Path           string
+	Capacity, Free float64
 }
 
 type snapshotInfo struct {
@@ -70,6 +80,11 @@ type hvms struct {
 	Snapshots                 []snapshotInfo
 	DSUsage                   []vmDSUsage
 	DSPerf                    []perfSample
+	Template                  float64
+	GuestToolsRunning         float64
+	GuestDisks                []guestDisk
+	RedAlarms                 float64
+	YellowAlarms              float64
 }
 type vmPerf struct {
 	CPU_COSTOP_SUMMATION              float64
@@ -248,6 +263,9 @@ type Status struct {
 	DS                  []totalds
 	VMS                 []hvms
 	HostConnected       float64
+	HostStandbyMode     float64 // none 0, entering 1, in 2, exiting 3
+	HostRedAlarms       float64
+	HostYellowAlarms    float64
 	HostCluster         string
 	HostPerf            []perfSample
 	VCenter             *vcenterInfo // only set on the first status of a vCenter target
@@ -273,6 +291,7 @@ type NumericSensorInfo struct {
 	SensorType     string
 	Id             string
 	SensorNumber   string
+	Value          float64 // CurrentReading with the unit modifier applied
 }
 
 type StorageStateInfo struct {

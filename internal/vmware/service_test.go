@@ -88,3 +88,70 @@ func TestCollectRecoversFromPanic(t *testing.T) {
 		t.Fatal("expected gather error, got nil")
 	}
 }
+
+type staticService struct{ st []*Status }
+
+func (s staticService) statuses() ([]*Status, error) { return s.st, nil }
+func (s staticService) error(error)                  {}
+
+// Sensors and guest disks are absent on the simulator, so the output is checked on a crafted status.
+// Duplicated sensors or partitions must not break the scrape (a duplicated label set fails Gather).
+func TestExtraMetricsFromStatus(t *testing.T) {
+	st := &Status{
+		HostName: "esx1", HostConnected: 1, HostStandbyMode: 2, HostRedAlarms: 1, HostYellowAlarms: 2,
+		SensorInfo: []NumericSensorInfo{
+			{Name: "Fan 1", SensorType: "fan", BaseUnits: "RPM", Id: "1", Value: 5400},
+			{Name: "Fan 1", SensorType: "fan", BaseUnits: "RPM", Id: "1", Value: 5400}, // duplicate
+			{Name: "Temp", SensorType: "temperature", BaseUnits: "Degrees C", Id: "2", Value: 41.5},
+		},
+		DS: []totalds{{dsname: "ds1", capacity: 100, freespace: 40, uncommitted: 30, maintenance: 2, vms: 3, hosts: 2, redAlarms: 1}},
+		VMS: []hvms{{
+			VmName: "vm1", Template: 1, GuestToolsRunning: 1, RedAlarms: 1,
+			GuestDisks: []guestDisk{{"/", 100, 10}, {"/var", 50, 5}},
+		}},
+	}
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(NewCollector(staticService{[]*Status{st}}))
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	got := map[string][]float64{}
+	for _, mf := range mfs {
+		for _, m := range mf.GetMetric() {
+			got[mf.GetName()] = append(got[mf.GetName()], m.GetGauge().GetValue())
+		}
+	}
+	want := map[string][]float64{
+		"vmware_exporter_host_sensor_value":             {5400, 41.5},
+		"vmware_exporter_host_standby_mode":             {2},
+		"vmware_exporter_host_red_alarms":               {1},
+		"vmware_exporter_host_yellow_alarms":            {2},
+		"vmware_exporter_datastore_provisioned_size":    {90},
+		"vmware_exporter_datastore_maintenance_mode":    {2},
+		"vmware_exporter_datastore_vms":                 {3},
+		"vmware_exporter_datastore_hosts":               {2},
+		"vmware_exporter_datastore_red_alarms":          {1},
+		"vmware_exporter_vm_template":                   {1},
+		"vmware_exporter_vm_guest_tools_running_status": {1},
+		"vmware_exporter_vm_guest_disk_capacity_size":   {100, 50},
+		"vmware_exporter_vm_guest_disk_free_size":       {10, 5},
+		"vmware_exporter_vm_red_alarms":                 {1},
+	}
+	for name, vals := range want {
+		g := got[name]
+		if len(g) != len(vals) {
+			t.Errorf("%s: got %v, want %v", name, g, vals)
+			continue
+		}
+		for _, v := range vals {
+			found := false
+			for _, x := range g {
+				found = found || x == v
+			}
+			if !found {
+				t.Errorf("%s: value %v missing in %v", name, v, g)
+			}
+		}
+	}
+}

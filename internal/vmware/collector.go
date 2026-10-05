@@ -1469,6 +1469,7 @@ func (c Collector) Collect(ch chan<- prometheus.Metric) {
 }
 
 func (c Collector) collectHost(ch chan<- prometheus.Metric, s *Status) {
+	s.SensorInfo = dedupSensors(s.SensorInfo)
 	c.extra.collect(ch, s)
 
 	ch <- prometheus.MustNewConstMetric(

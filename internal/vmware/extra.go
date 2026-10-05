@@ -47,6 +47,22 @@ type extraDescs struct {
 	vmDSUncommitted   *prometheus.Desc
 	vmDSUnshared      *prometheus.Desc
 
+	hostStandbyMode   *prometheus.Desc
+	hostRedAlarms     *prometheus.Desc
+	hostYellowAlarms  *prometheus.Desc
+	hostSensorValue   *prometheus.Desc
+	dsMaintenanceMode *prometheus.Desc
+	dsVMs             *prometheus.Desc
+	dsHosts           *prometheus.Desc
+	dsRedAlarms       *prometheus.Desc
+	dsYellowAlarms    *prometheus.Desc
+	vmTemplate        *prometheus.Desc
+	vmToolsRunning    *prometheus.Desc
+	vmGuestDiskCap    *prometheus.Desc
+	vmGuestDiskFree   *prometheus.Desc
+	vmRedAlarms       *prometheus.Desc
+	vmYellowAlarms    *prometheus.Desc
+
 	hostPerf     map[string]*prometheus.Desc // counter -> desc, labels: host_name
 	hostInstPerf map[string]*prometheus.Desc // labels: host_name, instance
 	vmDSPerf     map[string]*prometheus.Desc // labels: vm_name, host_name, instance
@@ -87,6 +103,22 @@ func newExtraDescs() *extraDescs {
 		vmDSUncommitted:   desc("vm", "datastore_uncommitted_size", "VM space uncommitted on a datastore in bytes", "vm_name", "host_name", "ds_name"),
 		vmDSUnshared:      desc("vm", "datastore_unshared_size", "VM unshared space on a datastore in bytes", "vm_name", "host_name", "ds_name"),
 
+		hostStandbyMode:   desc("host", "standby_mode", "Vmware Host standby mode, none 0, entering 1, in 2, exiting 3", "host_name"),
+		hostRedAlarms:     desc("host", "red_alarms", "Number of triggered red alarms of the host", "host_name"),
+		hostYellowAlarms:  desc("host", "yellow_alarms", "Number of triggered yellow alarms of the host", "host_name"),
+		hostSensorValue:   desc("host", "sensor_value", "Vmware Host numeric sensor reading (unit modifier applied, unit in base_units)", "host_name", "name", "sensor_type", "base_units", "id"),
+		dsMaintenanceMode: desc("datastore", "maintenance_mode", "Datastore maintenance mode, normal 0, enteringMaintenance 1, inMaintenance 2", "ds_name", "host_name"),
+		dsVMs:             desc("datastore", "vms", "Number of VMs on the datastore", "ds_name", "host_name"),
+		dsHosts:           desc("datastore", "hosts", "Number of hosts the datastore is mounted on", "ds_name", "host_name"),
+		dsRedAlarms:       desc("datastore", "red_alarms", "Number of triggered red alarms of the datastore", "ds_name", "host_name"),
+		dsYellowAlarms:    desc("datastore", "yellow_alarms", "Number of triggered yellow alarms of the datastore", "ds_name", "host_name"),
+		vmTemplate:        desc("vm", "template", "VM is a template 1, a regular VM 0", "vm_name", "host_name"),
+		vmToolsRunning:    desc("vm", "guest_tools_running_status", "VMware Tools are running 1, not running 0", "vm_name", "host_name"),
+		vmGuestDiskCap:    desc("vm", "guest_disk_capacity_size", "Guest file system capacity in bytes (needs VMware Tools)", "vm_name", "host_name", "partition"),
+		vmGuestDiskFree:   desc("vm", "guest_disk_free_size", "Guest file system free space in bytes (needs VMware Tools)", "vm_name", "host_name", "partition"),
+		vmRedAlarms:       desc("vm", "red_alarms", "Number of triggered red alarms of the VM", "vm_name", "host_name"),
+		vmYellowAlarms:    desc("vm", "yellow_alarms", "Number of triggered yellow alarms of the VM", "vm_name", "host_name"),
+
 		hostPerf:     newPerfDescs("host", hostCounters, []string{"host_name"}),
 		hostInstPerf: newPerfDescs("host", hostInstancedCounters, []string{"host_name", "instance"}),
 		vmDSPerf:     newPerfDescs("vm", vmInstancedCounters, []string{"vm_name", "host_name", "instance"}),
@@ -97,6 +129,9 @@ func (e *extraDescs) describe(ch chan<- *prometheus.Desc) {
 	for _, d := range []*prometheus.Desc{
 		e.vcenterInfo, e.hostConnected, e.hostClusterInfo, e.dsInfo, e.dsAccessible, e.dsUncommitted, e.dsProvisioned,
 		e.vmSnapshotCount, e.vmSnapshotCreated, e.vmDSCommitted, e.vmDSUncommitted, e.vmDSUnshared,
+		e.hostStandbyMode, e.hostRedAlarms, e.hostYellowAlarms, e.hostSensorValue,
+		e.dsMaintenanceMode, e.dsVMs, e.dsHosts, e.dsRedAlarms, e.dsYellowAlarms,
+		e.vmTemplate, e.vmToolsRunning, e.vmGuestDiskCap, e.vmGuestDiskFree, e.vmRedAlarms, e.vmYellowAlarms,
 	} {
 		ch <- d
 	}
@@ -128,6 +163,19 @@ func (e *extraDescs) collect(ch chan<- prometheus.Metric, s *Status) {
 	if s.HostCluster != "" {
 		gauge(e.hostClusterInfo, 1, s.HostName, s.HostCluster)
 	}
+	gauge(e.hostStandbyMode, s.HostStandbyMode, s.HostName)
+	gauge(e.hostRedAlarms, s.HostRedAlarms, s.HostName)
+	gauge(e.hostYellowAlarms, s.HostYellowAlarms, s.HostName)
+	sensorSeen := make(map[string]struct{}, len(s.SensorInfo))
+	for _, sn := range s.SensorInfo {
+		// the label set must be unique, otherwise the whole scrape fails
+		key := sn.Name + "\x00" + sn.SensorType + "\x00" + sn.BaseUnits + "\x00" + sn.Id
+		if _, dup := sensorSeen[key]; dup {
+			continue
+		}
+		sensorSeen[key] = struct{}{}
+		gauge(e.hostSensorValue, sn.Value, s.HostName, sn.Name, sn.SensorType, sn.BaseUnits, sn.Id)
+	}
 	for _, p := range s.HostPerf {
 		if p.Instance == "" {
 			if d, ok := e.hostPerf[p.Counter]; ok {
@@ -143,10 +191,23 @@ func (e *extraDescs) collect(ch chan<- prometheus.Metric, s *Status) {
 		gauge(e.dsAccessible, boolValue(ds.accessible), ds.dsname, s.HostName)
 		gauge(e.dsUncommitted, ds.uncommitted, ds.dsname, s.HostName)
 		gauge(e.dsProvisioned, ds.capacity-ds.freespace+ds.uncommitted, ds.dsname, s.HostName)
+		gauge(e.dsMaintenanceMode, ds.maintenance, ds.dsname, s.HostName)
+		gauge(e.dsVMs, ds.vms, ds.dsname, s.HostName)
+		gauge(e.dsHosts, ds.hosts, ds.dsname, s.HostName)
+		gauge(e.dsRedAlarms, ds.redAlarms, ds.dsname, s.HostName)
+		gauge(e.dsYellowAlarms, ds.yellowAlarms, ds.dsname, s.HostName)
 	}
 
 	for _, vm := range s.VMS {
 		gauge(e.vmSnapshotCount, vm.SnapshotCount, vm.VmName, s.HostName)
+		gauge(e.vmTemplate, vm.Template, vm.VmName, s.HostName)
+		gauge(e.vmToolsRunning, vm.GuestToolsRunning, vm.VmName, s.HostName)
+		gauge(e.vmRedAlarms, vm.RedAlarms, vm.VmName, s.HostName)
+		gauge(e.vmYellowAlarms, vm.YellowAlarms, vm.VmName, s.HostName)
+		for _, d := range vm.GuestDisks {
+			gauge(e.vmGuestDiskCap, d.Capacity, vm.VmName, s.HostName, d.Path)
+			gauge(e.vmGuestDiskFree, d.Free, vm.VmName, s.HostName, d.Path)
+		}
 		// snapshot names are not unique: the id keeps the series distinct
 		for _, sn := range vm.Snapshots {
 			gauge(e.vmSnapshotCreated, sn.Created, vm.VmName, s.HostName, sn.Name, fmt.Sprint(sn.Id))
