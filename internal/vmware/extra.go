@@ -64,8 +64,8 @@ type extraDescs struct {
 	vmYellowAlarms    *prometheus.Desc
 
 	hostPerf     map[string]*prometheus.Desc // counter -> desc, labels: host_name
-	hostInstPerf map[string]*prometheus.Desc // labels: host_name, instance
-	vmDSPerf     map[string]*prometheus.Desc // labels: vm_name, host_name, instance
+	hostInstPerf map[string]*prometheus.Desc // labels: host_name, ds_name|nic|device
+	vmDSPerf     map[string]*prometheus.Desc // labels: vm_name, host_name, ds_name
 }
 
 // perfMetricName turns a counter like "net.bytesRx.average" into "<prefix>_net_bytesrx_average".
@@ -73,13 +73,30 @@ func perfMetricName(prefix, counter string) string {
 	return prefix + "_" + strings.ToLower(strings.ReplaceAll(counter, ".", "_"))
 }
 
-func newPerfDescs(prefix string, counters []string, labels []string) map[string]*prometheus.Desc {
+// instanceLabel names the label of an instanced counter after what the instance is. It must not be
+// "instance": Prometheus uses that name for the scrape target and would rename it to exported_instance.
+func instanceLabel(counter string) string {
+	switch {
+	case strings.HasPrefix(counter, "datastore."):
+		return "ds_name"
+	case strings.HasPrefix(counter, "net."):
+		return "nic"
+	}
+	return "device"
+}
+
+// newPerfDescs creates one Desc per counter; instanced counters get one more label for the instance.
+func newPerfDescs(prefix string, counters []string, labels []string, instanced bool) map[string]*prometheus.Desc {
 	m := make(map[string]*prometheus.Desc, len(counters))
 	for _, c := range counters {
+		l := labels
+		if instanced {
+			l = append(append([]string{}, labels...), instanceLabel(c))
+		}
 		m[c] = prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "", perfMetricName(prefix, c)),
 			fmt.Sprintf("Vmware performance counter %s (real-time sample, vSphere units)", c),
-			labels, nil,
+			l, nil,
 		)
 	}
 	return m
@@ -119,9 +136,9 @@ func newExtraDescs() *extraDescs {
 		vmRedAlarms:       desc("vm", "red_alarms", "Number of triggered red alarms of the VM", "vm_name", "host_name"),
 		vmYellowAlarms:    desc("vm", "yellow_alarms", "Number of triggered yellow alarms of the VM", "vm_name", "host_name"),
 
-		hostPerf:     newPerfDescs("host", hostCounters, []string{"host_name"}),
-		hostInstPerf: newPerfDescs("host", hostInstancedCounters, []string{"host_name", "instance"}),
-		vmDSPerf:     newPerfDescs("vm", vmInstancedCounters, []string{"vm_name", "host_name", "instance"}),
+		hostPerf:     newPerfDescs("host", hostCounters, []string{"host_name"}, false),
+		hostInstPerf: newPerfDescs("host", hostInstancedCounters, []string{"host_name"}, true),
+		vmDSPerf:     newPerfDescs("vm", vmInstancedCounters, []string{"vm_name", "host_name"}, true),
 	}
 }
 
