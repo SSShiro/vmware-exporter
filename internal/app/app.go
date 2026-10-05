@@ -30,6 +30,9 @@ const vaultKeepAlivePause = 5 * time.Second
 
 // parseSeconds parses a Go duration ("30s") or a plain number of seconds ("30").
 func parseSeconds(v string, def time.Duration) (time.Duration, error) {
+	if v == "" {
+		return def, nil
+	}
 	if d, err := time.ParseDuration(v); err == nil && d > 0 {
 		return d, nil
 	}
