@@ -74,3 +74,17 @@ func TestProbeConcurrentAndGlobalRegistry(t *testing.T) {
 		t.Fatal("probe replaced prometheus.DefaultGatherer")
 	}
 }
+
+type panicService struct{ msg string }
+
+func (p panicService) status() (*Status, error) { panic(p.msg) }
+func (p panicService) error(error)              {}
+
+// A panic inside Collect runs outside of net/http's recover and used to kill the process.
+func TestCollectRecoversFromPanic(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(NewCollector(panicService{"boom"}))
+	if _, err := reg.Gather(); err == nil {
+		t.Fatal("expected gather error, got nil")
+	}
+}

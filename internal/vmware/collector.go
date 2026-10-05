@@ -3,6 +3,7 @@ package vmware
 import (
 	"fmt"
 	"github.com/prometheus/client_golang/prometheus"
+	"runtime/debug"
 )
 
 type Collector struct {
@@ -1439,6 +1440,16 @@ func (c Collector) Describe(descs chan<- *prometheus.Desc) {
 
 func (c Collector) Collect(ch chan<- prometheus.Metric) {
 	//Call Api and return metrics
+
+	// Collect runs in a goroutine of the prometheus registry, so a panic here is not caught by net/http
+	// and would kill the whole exporter: turn it into a failed scrape instead.
+	defer func() {
+		if r := recover(); r != nil {
+			err := fmt.Errorf("panic while collecting VMWare metrics: %v\n%s", r, debug.Stack())
+			c.ss.error(err)
+			ch <- prometheus.NewInvalidMetric(c.HostHardwareInfo, err)
+		}
+	}()
 
 	s, err := c.ss.status()
 

@@ -398,27 +398,30 @@ func (s *service) status() (*Status, error) {
 
 	}
 
-	if len(hss[0].Summary.Runtime.HealthSystemRuntime.SystemHealthInfo.NumericSensorInfo) > 0 {
-		for _, sensor := range hss[0].Summary.Runtime.HealthSystemRuntime.SystemHealthInfo.NumericSensorInfo {
-			status.SensorInfo = append(status.SensorInfo, NumericSensorInfo{
-				Name:           sensor.Name,
-				HealthState:    sensorHealthOf(sensor.HealthState),
-				CurrentReading: strconv.Itoa(int(float64(sensor.CurrentReading) * math.Pow(10, float64(sensor.UnitModifier)))),
-				BaseUnits:      sensor.BaseUnits,
-				SensorType:     sensor.SensorType,
-				Id:             sensor.Id,
-				SensorNumber:   strconv.Itoa(int(sensor.SensorNumber)),
-			})
-		}
-	}
-
-	if len(hss[0].Summary.Runtime.HealthSystemRuntime.HardwareStatusInfo.StorageStatusInfo) > 0 {
-		for _, storageSensor := range hss[0].Summary.Runtime.HealthSystemRuntime.HardwareStatusInfo.StorageStatusInfo {
-			if !checkSensorIfAppend(storageSensor.Name, status.StorageInfo) {
-				status.StorageInfo = append(status.StorageInfo, StorageStateInfo{
-					Name:   storageSensor.Name,
-					Status: sensorHealthOf(storageSensor.Status),
+	// health data is optional: the host may not report it (monitoring service down, disconnected, etc.)
+	if hsr := hss[0].Summary.Runtime.HealthSystemRuntime; hsr != nil {
+		if hsr.SystemHealthInfo != nil {
+			for _, sensor := range hsr.SystemHealthInfo.NumericSensorInfo {
+				status.SensorInfo = append(status.SensorInfo, NumericSensorInfo{
+					Name:           sensor.Name,
+					HealthState:    sensorHealthOf(sensor.HealthState),
+					CurrentReading: strconv.Itoa(int(float64(sensor.CurrentReading) * math.Pow(10, float64(sensor.UnitModifier)))),
+					BaseUnits:      sensor.BaseUnits,
+					SensorType:     sensor.SensorType,
+					Id:             sensor.Id,
+					SensorNumber:   strconv.Itoa(int(sensor.SensorNumber)),
 				})
+			}
+		}
+
+		if hsr.HardwareStatusInfo != nil {
+			for _, storageSensor := range hsr.HardwareStatusInfo.StorageStatusInfo {
+				if !checkSensorIfAppend(storageSensor.Name, status.StorageInfo) {
+					status.StorageInfo = append(status.StorageInfo, StorageStateInfo{
+						Name:   storageSensor.Name,
+						Status: sensorHealthOf(storageSensor.Status),
+					})
+				}
 			}
 		}
 	}
