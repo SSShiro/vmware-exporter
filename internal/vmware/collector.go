@@ -1451,7 +1451,7 @@ func (c Collector) Collect(ch chan<- prometheus.Metric) {
 		}
 	}()
 
-	s, err := c.ss.status()
+	statuses, err := c.ss.statuses()
 
 	if err != nil {
 		c.ss.error(fmt.Errorf("failed collecting VMWare metrics: %v", err))
@@ -1459,6 +1459,13 @@ func (c Collector) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 
+	// a vCenter target reports every host of its inventory
+	for _, s := range statuses {
+		c.collectHost(ch, s)
+	}
+}
+
+func (c Collector) collectHost(ch chan<- prometheus.Metric, s *Status) {
 	ch <- prometheus.MustNewConstMetric(
 		c.HostPowerState,
 		prometheus.GaugeValue,

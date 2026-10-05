@@ -3,14 +3,17 @@ package vmware
 import (
 	"context"
 	"fmt"
-	"github.com/vmware/govmomi/find"
+	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/view"
+	"github.com/vmware/govmomi/vim25"
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
 	"math"
 	"reflect"
+	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"vmware-exporter/pkg/logging"
 )
@@ -26,7 +29,7 @@ type service struct {
 }
 
 type Service interface {
-	status() (*Status, error)
+	statuses() ([]*Status, error)
 	error(err error)
 }
 
@@ -86,26 +89,13 @@ func (s *service) error(err error) {
 	s.logger.Error(err.Error())
 }
 
-func (s *service) status() (*Status, error) {
-	status := Status{
-		HostName:            "",
-		HostPowerState:      0,
-		HostMaintenanceMode: 0,
-		HostBoot:            0,
-		TotalCpu:            0,
-		UsageCpu:            0,
-		TotalMem:            0,
-		UsageMem:            0,
-		DiskOk:              []diskOk{},
-		NetworkPNICSpeed:    []pnic{},
-		HW:                  hwInfo{},
-		Product:             ProductInfo{},
-		SensorInfo:          []NumericSensorInfo{},
-		StorageInfo:         []StorageStateInfo{},
-		DS:                  []totalds{},
-		VMS:                 []hvms{},
-	}
+// maxHostWorkers limits parallel per-host requests so a big vCenter is not flooded.
+const maxHostWorkers = 8
 
+// statuses collects metrics from the target, which may be a standalone ESXi host or a vCenter:
+// inventory objects (hosts, datastores, VMs) are retrieved from the root folder and every host
+// gets its own Status, so the metrics keep the same host_name labels in both modes.
+func (s *service) statuses() ([]*Status, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), s.scrapeTimeout)
 	defer cancel()
 	c, err := NewClient(ctx, s.vmwareHost, s.vmwareUser, s.vmwarePassword)
@@ -121,342 +111,288 @@ func (s *service) status() (*Status, error) {
 		}
 	}()
 	m := view.NewManager(c.Client)
+	root := c.ServiceContent.RootFolder
 
 	var hss []mo.HostSystem
-	if err := retrieveView(ctx, m, c.ServiceContent.RootFolder, "HostSystem", []string{"summary"}, &hss); err != nil {
+	if err := retrieveView(ctx, m, root, "HostSystem", []string{"summary", "datastore"}, &hss); err != nil {
 		return nil, fmt.Errorf("retrieve HostSystem: %w", err)
 	}
 	if len(hss) == 0 {
-		return nil, fmt.Errorf("host %s returned no HostSystem objects", s.vmwareHost)
+		return nil, fmt.Errorf("%s returned no HostSystem objects", s.vmwareHost)
 	}
 
-	finder := find.NewFinder(c.Client)
-	hs, err := finder.DefaultHostSystem(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("find default host system: %w", err)
-	}
-	ss, err := hs.ConfigManager().StorageSystem(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("get storage system: %w", err)
-	}
-	var hostss mo.HostStorageSystem
-	if err := ss.Properties(ctx, ss.Reference(), nil, &hostss); err != nil {
-		return nil, fmt.Errorf("get storage system properties: %w", err)
+	var dss []mo.Datastore
+	if err := retrieveView(ctx, m, root, "Datastore", []string{"summary", "host"}, &dss); err != nil {
+		return nil, fmt.Errorf("retrieve Datastore: %w", err)
 	}
 
-	if len(hostss.StorageDeviceInfo.ScsiLun) > 0 {
-		for _, e := range hostss.StorageDeviceInfo.ScsiLun {
-			lun := e.GetScsiLun()
-			ok := 1.0
-			for _, s := range lun.OperationalState {
-				if s != "ok" {
-					ok = 0
-					break
+	var vms []mo.VirtualMachine
+	if err := retrieveView(ctx, m, root, "VirtualMachine", []string{"summary"}, &vms); err != nil {
+		return nil, fmt.Errorf("retrieve VirtualMachine: %w", err)
+	}
+
+	vmsRefs := make([]types.ManagedObjectReference, 0, len(vms))
+	vmsByHost := make(map[string][]mo.VirtualMachine)
+	for _, vm := range vms {
+		vmsRefs = append(vmsRefs, vm.Self)
+		if h := vm.Summary.Runtime.Host; h != nil {
+			vmsByHost[h.Value] = append(vmsByHost[h.Value], vm)
+		}
+	}
+
+	// a datastore is reported for every host it is mounted on, like a scrape of each ESXi would do.
+	// Both sides of the relation are used (Datastore.host and HostSystem.datastore) and merged.
+	dsInfo := make(map[string]totalds, len(dss))
+	dsByHost := make(map[string][]totalds)
+	dsSeen := make(map[[2]string]struct{})
+	addDS := func(host, ds string) {
+		item, ok := dsInfo[ds]
+		if _, dup := dsSeen[[2]string{host, ds}]; !ok || dup {
+			return
+		}
+		dsSeen[[2]string{host, ds}] = struct{}{}
+		dsByHost[host] = append(dsByHost[host], item)
+	}
+	for _, ds := range dss {
+		dsInfo[ds.Self.Value] = totalds{ds.Summary.Name, float64(ds.Summary.Capacity), float64(ds.Summary.FreeSpace)}
+	}
+	for _, ds := range dss {
+		for _, mount := range ds.Host {
+			addDS(mount.Key.Value, ds.Self.Value)
+		}
+	}
+	for _, h := range hss {
+		for _, ref := range h.Datastore {
+			addDS(h.Self.Value, ref.Value)
+		}
+	}
+
+	// perf counters are optional: a failure must not drop all the other metrics
+	vmPerfMetrics, err := perfMon(ctx, c, vmsRefs, s.logger)
+	if err != nil {
+		s.logger.Error(fmt.Sprintf("collect VM performance metrics from %s failed: %v", s.vmwareHost, err))
+	}
+
+	result := make([]*Status, len(hss))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxHostWorkers)
+	for i := range hss {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			// a panic in this goroutine is not covered by the recover in Collect and would kill the process
+			defer func() {
+				if r := recover(); r != nil {
+					s.logger.Error(fmt.Sprintf("panic while collecting host %s: %v\n%s", hss[i].Self.Value, r, debug.Stack()))
+				}
+			}()
+			h := hss[i]
+			result[i] = s.hostStatus(ctx, c.Client, &h, dsByHost[h.Self.Value], vmsByHost[h.Self.Value], vmPerfMetrics)
+		}(i)
+	}
+	wg.Wait()
+
+	statuses := make([]*Status, 0, len(result))
+	for _, st := range result {
+		if st != nil {
+			statuses = append(statuses, st)
+		}
+	}
+	if len(statuses) == 0 {
+		return nil, fmt.Errorf("no host of %s could be collected", s.vmwareHost)
+	}
+	return statuses, nil
+}
+
+// hostStatus builds the Status of one host. Details that can not be read (e.g. the host is
+// disconnected) are skipped and logged, the rest of the metrics is still reported.
+func (s *service) hostStatus(ctx context.Context, c *vim25.Client, h *mo.HostSystem, dss []totalds, vms []mo.VirtualMachine, perf map[string][]vmMetric) *Status {
+	status := Status{
+		DiskOk:           []diskOk{},
+		NetworkPNICSpeed: []pnic{},
+		SensorInfo:       []NumericSensorInfo{},
+		StorageInfo:      []StorageStateInfo{},
+		DS:               dss,
+		VMS:              []hvms{},
+	}
+
+	sum := h.Summary
+	status.HostName = sum.Config.Name
+	if status.HostName == "" {
+		status.HostName = h.Self.Value
+	}
+	if p := sum.Config.Product; p != nil {
+		status.Product.Name = p.Name
+		status.Product.FullName = p.FullName
+		status.Product.Vendor = p.Vendor
+		status.Product.Version = p.Version
+		status.Product.Build = p.Build
+		status.Product.OsType = p.OsType
+		status.Product.ApiVersion = p.ApiVersion
+		status.Product.LicenseProductName = p.LicenseProductName
+		status.Product.LicenseVersion = p.LicenseProductVersion
+	}
+	if hw := sum.Hardware; hw != nil {
+		status.TotalCpu = float64(int64(hw.CpuMhz) * int64(hw.NumCpuCores))
+		status.TotalMem = float64(hw.MemorySize)
+		status.HW.Vendor = hw.Vendor
+		status.HW.Model = hw.Model
+		status.HW.Uuid = hw.Uuid
+		status.HW.CpuModel = hw.CpuModel
+		status.HW.NumCpuPkgs = float64(hw.NumCpuPkgs)
+		status.HW.CpuMhz = float64(hw.CpuMhz)
+		status.HW.NumCpuCores = float64(hw.NumCpuCores)
+		status.HW.NumCpuThreads = float64(hw.NumCpuThreads)
+		status.HW.NumNics = float64(hw.NumNics)
+		status.HW.NumHBAs = float64(hw.NumHBAs)
+	}
+	status.UsageCpu = float64(sum.QuickStats.OverallCpuUsage)
+	status.UsageMem = float64(sum.QuickStats.OverallMemoryUsage) * 1024 * 1024
+
+	connected := true
+	if rt := sum.Runtime; rt != nil {
+		status.HostPowerState = powerState(rt.PowerState)
+		status.HostMaintenanceMode = maintenanceMode(rt.InMaintenanceMode)
+		if rt.BootTime != nil {
+			status.HostBoot = float64(rt.BootTime.Unix())
+		}
+		connected = rt.ConnectionState == types.HostSystemConnectionStateConnected
+		// health data is optional: the host may not report it (monitoring service down, disconnected, etc.)
+		if hsr := rt.HealthSystemRuntime; hsr != nil {
+			if hsr.SystemHealthInfo != nil {
+				for _, sensor := range hsr.SystemHealthInfo.NumericSensorInfo {
+					status.SensorInfo = append(status.SensorInfo, NumericSensorInfo{
+						Name:           sensor.Name,
+						HealthState:    sensorHealthOf(sensor.HealthState),
+						CurrentReading: strconv.Itoa(int(float64(sensor.CurrentReading) * math.Pow(10, float64(sensor.UnitModifier)))),
+						BaseUnits:      sensor.BaseUnits,
+						SensorType:     sensor.SensorType,
+						Id:             sensor.Id,
+						SensorNumber:   strconv.Itoa(int(sensor.SensorNumber)),
+					})
 				}
 			}
-			status.DiskOk = append(status.DiskOk, diskOk{lun.DeviceName, ok})
+			if hsr.HardwareStatusInfo != nil {
+				for _, storageSensor := range hsr.HardwareStatusInfo.StorageStatusInfo {
+					if !checkSensorIfAppend(storageSensor.Name, status.StorageInfo) {
+						status.StorageInfo = append(status.StorageInfo, StorageStateInfo{
+							Name:   storageSensor.Name,
+							Status: sensorHealthOf(storageSensor.Status),
+						})
+					}
+				}
+			}
+		}
+	}
+
+	if connected {
+		s.hostDevices(ctx, c, h, &status)
+	} else {
+		s.logger.Info(fmt.Sprintf("host %s is not connected, storage and network details are skipped", status.HostName))
+	}
+
+	// VM names are unique only per folder in vCenter, while a duplicated label set fails the whole scrape
+	seen := make(map[string]struct{}, len(vms))
+	for _, vm := range vms {
+		st := vmStatus(vm, perf[vm.Self.Value])
+		if _, dup := seen[st.VmName]; dup {
+			st.VmName = fmt.Sprintf("%s (%s)", st.VmName, vm.Self.Value)
+		}
+		seen[st.VmName] = struct{}{}
+		status.VMS = append(status.VMS, st)
+	}
+	return &status
+}
+
+// hostDevices reads LUN states and physical NIC speeds through the host config managers.
+func (s *service) hostDevices(ctx context.Context, c *vim25.Client, h *mo.HostSystem, status *Status) {
+	hs := object.NewHostSystem(c, h.Self)
+
+	ss, err := hs.ConfigManager().StorageSystem(ctx)
+	if err != nil {
+		s.logger.Error(fmt.Sprintf("host %s: get storage system: %v", status.HostName, err))
+	} else {
+		var hostss mo.HostStorageSystem
+		if err := ss.Properties(ctx, ss.Reference(), []string{"storageDeviceInfo"}, &hostss); err != nil {
+			s.logger.Error(fmt.Sprintf("host %s: get storage system properties: %v", status.HostName, err))
+		} else if hostss.StorageDeviceInfo != nil {
+			for _, e := range hostss.StorageDeviceInfo.ScsiLun {
+				lun := e.GetScsiLun()
+				ok := 1.0
+				for _, st := range lun.OperationalState {
+					if st != "ok" {
+						ok = 0
+						break
+					}
+				}
+				status.DiskOk = append(status.DiskOk, diskOk{lun.DeviceName, ok})
+			}
 		}
 	}
 
 	nn, err := hs.ConfigManager().NetworkSystem(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("get network system: %w", err)
+		s.logger.Error(fmt.Sprintf("host %s: get network system: %v", status.HostName, err))
+		return
 	}
 	var hostsn mo.HostNetworkSystem
-	if err := nn.Properties(ctx, nn.Reference(), nil, &hostsn); err != nil {
-		return nil, fmt.Errorf("get network system properties: %w", err)
+	if err := nn.Properties(ctx, nn.Reference(), []string{"networkInfo"}, &hostsn); err != nil {
+		s.logger.Error(fmt.Sprintf("host %s: get network system properties: %v", status.HostName, err))
+		return
+	}
+	if hostsn.NetworkInfo == nil {
+		return
 	}
 	for _, ni := range hostsn.NetworkInfo.Pnic {
 		var lSpeed float64
 		if ni.LinkSpeed != nil {
 			lSpeed = float64(ni.LinkSpeed.SpeedMb)
 		}
-
 		status.NetworkPNICSpeed = append(status.NetworkPNICSpeed, pnic{ni.Device, ni.Mac, lSpeed})
 	}
+}
 
-	// Datastore Metrics
-	var dss []mo.Datastore
-	if err := retrieveView(ctx, m, c.ServiceContent.RootFolder, "Datastore", []string{"summary"}, &dss); err != nil {
-		return nil, fmt.Errorf("retrieve Datastore: %w", err)
-	}
-	for _, ds := range dss {
-		status.DS = append(status.DS, totalds{ds.Summary.Name, float64(ds.Summary.Capacity), float64(ds.Summary.FreeSpace)})
-	}
-
-	// Guest VM Metrics
-	var vms []mo.VirtualMachine
-	if err := retrieveView(ctx, m, c.ServiceContent.RootFolder, "VirtualMachine", nil, &vms); err != nil {
-		return nil, fmt.Errorf("retrieve VirtualMachine: %w", err)
-	}
-
-	vmsRefs := make([]types.ManagedObjectReference, 0, len(vms))
-	for _, vm := range vms {
-		vmsRefs = append(vmsRefs, vm.Self)
-	}
-
-	// perf counters are optional: a failure must not drop all the other metrics
-	vmPerfMetrics, err := perfMon(ctx, c, vmsRefs)
-	if err != nil {
-		s.logger.Error(fmt.Sprintf("collect VM performance metrics from %s failed: %v", s.vmwareHost, err))
-	}
-
-	for _, vm := range vms {
-		vmNum := vm.GetManagedEntity().Self.Value
-		vmname := vm.Summary.Config.Name
-
-		perfMetrics, ok := vmPerfMetrics[vmNum]
-
-		vmPerfRes := vmPerf{
-			CPU_COSTOP_SUMMATION:              0,
-			CPU_DEMANDENTITLEMENTRATIO_LATEST: 0,
-			CPU_DEMAND_AVERAGE:                0,
-			CPU_ENTITLEMENT_LATEST:            0,
-			CPU_IDLE_SUMMATION:                0,
-			CPU_LATENCY_AVERAGE:               0,
-			CPU_MAXLIMITED_SUMMATION:          0,
-			CPU_OVERLAP_SUMMATION:             0,
-			CPU_READINESS_AVERAGE:             0,
-			CPU_READY_SUMMATION:               0,
-			CPU_RUN_SUMMATION:                 0,
-			CPU_SWAPWAIT_SUMMATION:            0,
-			CPU_SYSTEM_SUMMATION:              0,
-			CPU_USAGEMHZ_AVERAGE:              0,
-			CPU_USAGEMHZ_MAXIMUM:              0,
-			CPU_USAGEMHZ_MINIMUM:              0,
-			CPU_USAGEMHZ_NONE:                 0,
-			CPU_USAGE_AVERAGE:                 0,
-			CPU_USAGE_MAXIMUM:                 0,
-			CPU_USAGE_MINIMUM:                 0,
-			CPU_USAGE_NONE:                    0,
-			CPU_USED_SUMMATION:                0,
-			CPU_WAIT_SUMMATION:                0,
-			DATASTORE_MAXTOTALLATENCY_LATEST:  0,
-			DISK_MAXTOTALLATENCY_LATEST:       0,
-			DISK_READ_AVERAGE:                 0,
-			DISK_USAGE_AVERAGE:                0,
-			DISK_USAGE_MAXIMUM:                0,
-			DISK_USAGE_MINIMUM:                0,
-			DISK_USAGE_NONE:                   0,
-			DISK_WRITE_AVERAGE:                0,
-			MEM_ACTIVEWRITE_AVERAGE:           0,
-			MEM_ACTIVE_AVERAGE:                0,
-			MEM_ACTIVE_MAXIMUM:                0,
-			MEM_ACTIVE_MINIMUM:                0,
-			MEM_ACTIVE_NONE:                   0,
-			MEM_COMPRESSED_AVERAGE:            0,
-			MEM_COMPRESSIONRATE_AVERAGE:       0,
-			MEM_CONSUMED_AVERAGE:              0,
-			MEM_CONSUMED_MAXIMUM:              0,
-			MEM_CONSUMED_MINIMUM:              0,
-			MEM_CONSUMED_NONE:                 0,
-			MEM_DECOMPRESSIONRATE_AVERAGE:     0,
-			MEM_ENTITLEMENT_AVERAGE:           0,
-			MEM_GRANTED_AVERAGE:               0,
-			MEM_GRANTED_MAXIMUM:               0,
-			MEM_GRANTED_MINIMUM:               0,
-			MEM_GRANTED_NONE:                  0,
-			MEM_LATENCY_AVERAGE:               0,
-			MEM_LLSWAPINRATE_AVERAGE:          0,
-			MEM_LLSWAPOUTRATE_AVERAGE:         0,
-			MEM_LLSWAPUSED_AVERAGE:            0,
-			MEM_LLSWAPUSED_MAXIMUM:            0,
-			MEM_LLSWAPUSED_MINIMUM:            0,
-			MEM_LLSWAPUSED_NONE:               0,
-			MEM_OVERHEADMAX_AVERAGE:           0,
-			MEM_OVERHEADTOUCHED_AVERAGE:       0,
-			MEM_OVERHEAD_AVERAGE:              0,
-			MEM_OVERHEAD_MAXIMUM:              0,
-			MEM_OVERHEAD_MINIMUM:              0,
-			MEM_OVERHEAD_NONE:                 0,
-			MEM_SHARED_AVERAGE:                0,
-			MEM_SHARED_MAXIMUM:                0,
-			MEM_SHARED_MINIMUM:                0,
-			MEM_SHARED_NONE:                   0,
-			MEM_SWAPINRATE_AVERAGE:            0,
-			MEM_SWAPIN_AVERAGE:                0,
-			MEM_SWAPIN_MAXIMUM:                0,
-			MEM_SWAPIN_MINIMUM:                0,
-			MEM_SWAPIN_NONE:                   0,
-			MEM_SWAPOUTRATE_AVERAGE:           0,
-			MEM_SWAPOUT_AVERAGE:               0,
-			MEM_SWAPOUT_MAXIMUM:               0,
-			MEM_SWAPOUT_MINIMUM:               0,
-			MEM_SWAPOUT_NONE:                  0,
-			MEM_SWAPPED_AVERAGE:               0,
-			MEM_SWAPPED_MAXIMUM:               0,
-			MEM_SWAPPED_MINIMUM:               0,
-			MEM_SWAPPED_NONE:                  0,
-			MEM_SWAPTARGET_AVERAGE:            0,
-			MEM_SWAPTARGET_MAXIMUM:            0,
-			MEM_SWAPTARGET_MINIMUM:            0,
-			MEM_SWAPTARGET_NONE:               0,
-			MEM_USAGE_AVERAGE:                 0,
-			MEM_USAGE_MAXIMUM:                 0,
-			MEM_USAGE_MINIMUM:                 0,
-			MEM_USAGE_NONE:                    0,
-			MEM_VMMEMCTLTARGET_AVERAGE:        0,
-			MEM_VMMEMCTLTARGET_MAXIMUM:        0,
-			MEM_VMMEMCTLTARGET_MINIMUM:        0,
-			MEM_VMMEMCTLTARGET_NONE:           0,
-			MEM_VMMEMCTL_AVERAGE:              0,
-			MEM_VMMEMCTL_MAXIMUM:              0,
-			MEM_VMMEMCTL_MINIMUM:              0,
-			MEM_VMMEMCTL_NONE:                 0,
-			MEM_ZERO_AVERAGE:                  0,
-			MEM_ZERO_MAXIMUM:                  0,
-			MEM_ZERO_MINIMUM:                  0,
-			MEM_ZERO_NONE:                     0,
-			MEM_ZIPPED_LATEST:                 0,
-			MEM_ZIPSAVED_LATEST:               0,
-			NET_BROADCASTRX_SUMMATION:         0,
-			NET_BROADCASTTX_SUMMATION:         0,
-			NET_BYTESRX_AVERAGE:               0,
-			NET_BYTESTX_AVERAGE:               0,
-			NET_DROPPEDRX_SUMMATION:           0,
-			NET_DROPPEDTX_SUMMATION:           0,
-			NET_MULTICASTRX_SUMMATION:         0,
-			NET_MULTICASTTX_SUMMATION:         0,
-			NET_PACKETSRX_SUMMATION:           0,
-			NET_PACKETSTX_SUMMATION:           0,
-			NET_PNICBYTESRX_AVERAGE:           0,
-			NET_PNICBYTESTX_AVERAGE:           0,
-			NET_RECEIVED_AVERAGE:              0,
-			NET_TRANSMITTED_AVERAGE:           0,
-			NET_USAGE_AVERAGE:                 0,
-			NET_USAGE_MAXIMUM:                 0,
-			NET_USAGE_MINIMUM:                 0,
-			NET_USAGE_NONE:                    0,
-			POWER_ENERGY_SUMMATION:            0,
-			POWER_POWER_AVERAGE:               0,
-			RESCPU_ACTAV15_LATEST:             0,
-			RESCPU_ACTAV1_LATEST:              0,
-			RESCPU_ACTAV5_LATEST:              0,
-			RESCPU_ACTPK15_LATEST:             0,
-			RESCPU_ACTPK1_LATEST:              0,
-			RESCPU_ACTPK5_LATEST:              0,
-			RESCPU_MAXLIMITED15_LATEST:        0,
-			RESCPU_MAXLIMITED1_LATEST:         0,
-			RESCPU_MAXLIMITED5_LATEST:         0,
-			RESCPU_RUNAV15_LATEST:             0,
-			RESCPU_RUNAV1_LATEST:              0,
-			RESCPU_RUNAV5_LATEST:              0,
-			RESCPU_RUNPK15_LATEST:             0,
-			RESCPU_RUNPK1_LATEST:              0,
-			RESCPU_RUNPK5_LATEST:              0,
-			RESCPU_SAMPLECOUNT_LATEST:         0,
-			RESCPU_SAMPLEPERIOD_LATEST:        0,
-			SYS_HEARTBEAT_LATEST:              0,
-			SYS_OSUPTIME_LATEST:               0,
-			SYS_UPTIME_LATEST:                 0,
-			VIRTUALDISK_READ_AVERAGE:          0,
-			VIRTUALDISK_WRITE_AVERAGE:         0,
+// vmStatus converts a VM summary and its performance counters; Guest and Storage may be absent
+// (powered off, inaccessible or orphaned VMs).
+func vmStatus(vm mo.VirtualMachine, perfMetrics []vmMetric) hvms {
+	var vmPerfRes vmPerf
+	r := reflect.ValueOf(&vmPerfRes).Elem()
+	for _, v := range perfMetrics {
+		value, err := strconv.Atoi(v.MetricValue)
+		if err != nil {
+			continue
 		}
-
-		if ok {
-			for _, v := range perfMetrics {
-				value, err := strconv.Atoi(v.MetricValue)
-				if err == nil {
-					metricName := strings.ToUpper(strings.Replace(v.MetricName, ".", "_", -1))
-					metricValue := float64(value)
-
-					r := reflect.ValueOf(&vmPerfRes).Elem()
-					if r.Kind() == reflect.Struct {
-						f := r.FieldByName(metricName)
-						if f.IsValid() {
-							if f.CanSet() {
-								if f.Kind() == reflect.Float64 {
-									f.SetFloat(metricValue)
-								}
-							}
-						}
-					}
-					//r.FieldByName(metricName).SetFloat(metricValue)
-				}
-
-			}
-		}
-
-		status.VMS = append(status.VMS, hvms{
-			VmName:                    vmname,
-			VmPowerState:              powerStateVM(vm.Summary.Runtime.PowerState),
-			VmGuestId:                 vm.Summary.Guest.GuestId,
-			VmGuestToolsStatus:        guestToolsStatus(string(vm.Summary.Guest.ToolsStatus)),
-			VmGuestToolsVersion:       guestToolsVersion(vm.Summary.Guest.ToolsVersionStatus),
-			VmGuestFullName:           vm.Summary.Guest.GuestFullName,
-			VmGuestIpAddr:             vm.Summary.Guest.IpAddress,
-			VmGuestStorageCommitted:   float64(vm.Summary.Storage.Committed),
-			VmGuestStorageUnCommitted: float64(vm.Summary.Storage.Uncommitted),
-			VmBoot:                    convertTime(vm),
-			VmCpuAval:                 float64(vm.Summary.Runtime.MaxCpuUsage),
-			VmCpuUsage:                float64(vm.Summary.QuickStats.OverallCpuUsage),
-			VmNumCpu:                  float64(vm.Summary.Config.NumCpu),
-			VmMemAval:                 float64(vm.Summary.Config.MemorySizeMB),
-			VmMemUsage:                float64(vm.Summary.QuickStats.HostMemoryUsage),
-			Perf:                      vmPerfRes,
-		})
-
-	}
-
-	// health data is optional: the host may not report it (monitoring service down, disconnected, etc.)
-	if hsr := hss[0].Summary.Runtime.HealthSystemRuntime; hsr != nil {
-		if hsr.SystemHealthInfo != nil {
-			for _, sensor := range hsr.SystemHealthInfo.NumericSensorInfo {
-				status.SensorInfo = append(status.SensorInfo, NumericSensorInfo{
-					Name:           sensor.Name,
-					HealthState:    sensorHealthOf(sensor.HealthState),
-					CurrentReading: strconv.Itoa(int(float64(sensor.CurrentReading) * math.Pow(10, float64(sensor.UnitModifier)))),
-					BaseUnits:      sensor.BaseUnits,
-					SensorType:     sensor.SensorType,
-					Id:             sensor.Id,
-					SensorNumber:   strconv.Itoa(int(sensor.SensorNumber)),
-				})
-			}
-		}
-
-		if hsr.HardwareStatusInfo != nil {
-			for _, storageSensor := range hsr.HardwareStatusInfo.StorageStatusInfo {
-				if !checkSensorIfAppend(storageSensor.Name, status.StorageInfo) {
-					status.StorageInfo = append(status.StorageInfo, StorageStateInfo{
-						Name:   storageSensor.Name,
-						Status: sensorHealthOf(storageSensor.Status),
-					})
-				}
-			}
+		metricName := strings.ToUpper(strings.Replace(v.MetricName, ".", "_", -1))
+		if f := r.FieldByName(metricName); f.IsValid() && f.CanSet() && f.Kind() == reflect.Float64 {
+			f.SetFloat(float64(value))
 		}
 	}
 
-	status.HostName = hss[0].Summary.Config.Name
-	status.HostPowerState = powerState(hss[0].Summary.Runtime.PowerState)
-	status.HostMaintenanceMode = maintenanceMode(hss[0].Summary.Runtime.InMaintenanceMode)
-	if bt := hss[0].Summary.Runtime.BootTime; bt != nil {
-		status.HostBoot = float64(bt.Unix())
+	res := hvms{
+		VmName:       vm.Summary.Config.Name,
+		VmPowerState: powerStateVM(vm.Summary.Runtime.PowerState),
+		VmBoot:       convertTime(vm),
+		VmCpuAval:    float64(vm.Summary.Runtime.MaxCpuUsage),
+		VmCpuUsage:   float64(vm.Summary.QuickStats.OverallCpuUsage),
+		VmNumCpu:     float64(vm.Summary.Config.NumCpu),
+		VmMemAval:    float64(vm.Summary.Config.MemorySizeMB),
+		VmMemUsage:   float64(vm.Summary.QuickStats.HostMemoryUsage),
+		Perf:         vmPerfRes,
 	}
-	status.TotalCpu = totalCpu(hss[0])
-	status.UsageCpu = float64(hss[0].Summary.QuickStats.OverallCpuUsage)
-	status.TotalMem = float64(hss[0].Summary.Hardware.MemorySize)
-	status.UsageMem = float64(hss[0].Summary.QuickStats.OverallMemoryUsage) * 1024 * 1024
-	status.HW.Vendor = hss[0].Summary.Hardware.Vendor
-	status.HW.Model = hss[0].Summary.Hardware.Model
-	status.HW.Uuid = hss[0].Summary.Hardware.Uuid
-	status.HW.CpuModel = hss[0].Summary.Hardware.CpuModel
-	status.HW.NumCpuPkgs = float64(hss[0].Summary.Hardware.NumCpuPkgs)
-	status.HW.CpuMhz = float64(hss[0].Summary.Hardware.CpuMhz)
-	status.HW.NumCpuCores = float64(hss[0].Summary.Hardware.NumCpuCores)
-	status.HW.NumCpuThreads = float64(hss[0].Summary.Hardware.NumCpuThreads)
-	status.HW.NumNics = float64(hss[0].Summary.Hardware.NumNics)
-	status.HW.NumHBAs = float64(hss[0].Summary.Hardware.NumHBAs)
-	status.Product.Name = hss[0].Summary.Config.Product.Name
-	status.Product.FullName = hss[0].Summary.Config.Product.FullName
-	status.Product.Vendor = hss[0].Summary.Config.Product.Vendor
-	status.Product.Version = hss[0].Summary.Config.Product.Version
-	status.Product.Build = hss[0].Summary.Config.Product.Build
-	status.Product.OsType = hss[0].Summary.Config.Product.OsType
-	status.Product.ApiVersion = hss[0].Summary.Config.Product.ApiVersion
-	status.Product.LicenseProductName = hss[0].Summary.Config.Product.LicenseProductName
-	status.Product.LicenseVersion = hss[0].Summary.Config.Product.LicenseProductVersion
-
-	return &status, nil
+	if g := vm.Summary.Guest; g != nil {
+		res.VmGuestId = g.GuestId
+		res.VmGuestToolsStatus = guestToolsStatus(string(g.ToolsStatus))
+		res.VmGuestToolsVersion = guestToolsVersion(g.ToolsVersionStatus)
+		res.VmGuestFullName = g.GuestFullName
+		res.VmGuestIpAddr = g.IpAddress
+	}
+	if st := vm.Summary.Storage; st != nil {
+		res.VmGuestStorageCommitted = float64(st.Committed)
+		res.VmGuestStorageUnCommitted = float64(st.Uncommitted)
+	}
+	return res
 }
 
 // retrieveView loads properties of all objects of the given type and always destroys the view,

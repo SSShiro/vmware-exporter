@@ -77,8 +77,8 @@ func TestProbeConcurrentAndGlobalRegistry(t *testing.T) {
 
 type panicService struct{ msg string }
 
-func (p panicService) status() (*Status, error) { panic(p.msg) }
-func (p panicService) error(error)              {}
+func (p panicService) statuses() ([]*Status, error) { panic(p.msg) }
+func (p panicService) error(error)                  {}
 
 // A panic inside Collect runs outside of net/http's recover and used to kill the process.
 func TestCollectRecoversFromPanic(t *testing.T) {

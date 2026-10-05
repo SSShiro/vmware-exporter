@@ -8,6 +8,7 @@ import (
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
 	"strings"
+	"vmware-exporter/pkg/logging"
 )
 
 type vmMetric struct {
@@ -98,8 +99,13 @@ func maintenanceMode(s bool) float64 {
 	return 0
 }
 
+// perfBatchSize limits the number of VMs in one QueryPerf request: a single request for every VM
+// of a big vCenter may exceed the scrape timeout or the server limits.
+const perfBatchSize = 100
+
 // perfMon returns performance counters per VM (key is the VM managed object id).
-func perfMon(ctx context.Context, c *govmomi.Client, vms []types.ManagedObjectReference) (map[string][]vmMetric, error) {
+// A failed batch is logged and skipped, the other batches are still collected.
+func perfMon(ctx context.Context, c *govmomi.Client, vms []types.ManagedObjectReference, l *logging.Logger) (map[string][]vmMetric, error) {
 	if len(vms) == 0 {
 		return nil, nil
 	}
@@ -125,40 +131,51 @@ func perfMon(ctx context.Context, c *govmomi.Client, vms []types.ManagedObjectRe
 		IntervalId: int32(interval),
 	}
 
-	// Query metrics
-	sample, err := perfManager.SampleByName(ctx, spec, names, vms)
-	if err != nil {
-		return nil, fmt.Errorf("sample: %w", err)
-	}
-
-	result, err := perfManager.ToMetricSeries(ctx, sample)
-	if err != nil {
-		return nil, fmt.Errorf("metric series: %w", err)
-	}
-
 	metricsRes := make(map[string][]vmMetric)
-	for _, metric := range result {
-		var vmMetrics []vmMetric
-		for _, v := range metric.Value {
-			if len(v.Value) == 0 {
-				continue
-			}
-			instance := v.Instance
-			if instance == "" {
-				instance = "-"
-			}
-			var unit string
-			if ci, ok := counters[v.Name]; ok && ci.UnitInfo != nil {
-				unit = ci.UnitInfo.GetElementDescription().Label
-			}
-			vmMetrics = append(vmMetrics, vmMetric{
-				Instance:    instance,
-				MetricName:  v.Name,
-				MetricValue: v.ValueCSV(),
-				MetricUnit:  unit,
-			})
+	for start := 0; start < len(vms); start += perfBatchSize {
+		end := start + perfBatchSize
+		if end > len(vms) {
+			end = len(vms)
 		}
-		metricsRes[metric.Entity.Value] = vmMetrics
+		if ctx.Err() != nil {
+			return metricsRes, ctx.Err()
+		}
+
+		// Query metrics
+		sample, err := perfManager.SampleByName(ctx, spec, names, vms[start:end])
+		if err != nil {
+			l.Error(fmt.Sprintf("perf sample of VMs %d-%d failed: %v", start, end, err))
+			continue
+		}
+		result, err := perfManager.ToMetricSeries(ctx, sample)
+		if err != nil {
+			l.Error(fmt.Sprintf("perf metric series of VMs %d-%d failed: %v", start, end, err))
+			continue
+		}
+
+		for _, metric := range result {
+			var vmMetrics []vmMetric
+			for _, v := range metric.Value {
+				if len(v.Value) == 0 {
+					continue
+				}
+				instance := v.Instance
+				if instance == "" {
+					instance = "-"
+				}
+				var unit string
+				if ci, ok := counters[v.Name]; ok && ci.UnitInfo != nil {
+					unit = ci.UnitInfo.GetElementDescription().Label
+				}
+				vmMetrics = append(vmMetrics, vmMetric{
+					Instance:    instance,
+					MetricName:  v.Name,
+					MetricValue: v.ValueCSV(),
+					MetricUnit:  unit,
+				})
+			}
+			metricsRes[metric.Entity.Value] = vmMetrics
+		}
 	}
 	return metricsRes, nil
 }
