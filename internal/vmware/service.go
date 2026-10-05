@@ -2,9 +2,11 @@ package vmware
 
 import (
 	"context"
+	"fmt"
 	"github.com/vmware/govmomi/find"
 	"github.com/vmware/govmomi/view"
 	"github.com/vmware/govmomi/vim25/mo"
+	"github.com/vmware/govmomi/vim25/types"
 	"math"
 	"reflect"
 	"strconv"
@@ -30,6 +32,27 @@ type Service interface {
 
 var interval = 20
 
+const (
+	defaultScrapeTimeout = 60 * time.Second
+	// logoutTimeout limits cleanup calls, which must not depend on the (possibly expired) scrape context.
+	logoutTimeout = 10 * time.Second
+)
+
+// parseTimeout accepts a Go duration ("30s") or a plain number of seconds ("30").
+func parseTimeout(v string, def time.Duration) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return def
+	}
+	if d, err := time.ParseDuration(v); err == nil && d > 0 {
+		return d
+	}
+	if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		return time.Duration(n) * time.Second
+	}
+	return def
+}
+
 func NewService(l *logging.Logger, host string, config interface{}) Service {
 	cfg := reflect.ValueOf(config).Elem()
 
@@ -45,10 +68,9 @@ func NewService(l *logging.Logger, host string, config interface{}) Service {
 		vmwarePass = "password"
 	}
 
-	scrapeTimeout, err := time.ParseDuration(cfg.FieldByName("ScrapeTimeout").Interface().(string))
-	if err != nil {
-		l.Debug("scrape timeout not specified, use default timeout")
-		scrapeTimeout = 60
+	scrapeTimeout := parseTimeout(cfg.FieldByName("ScrapeTimeout").Interface().(string), defaultScrapeTimeout)
+	if scrapeTimeout == defaultScrapeTimeout {
+		l.Debug("scrape timeout not specified or invalid, use default timeout")
 	}
 
 	return &service{
@@ -84,39 +106,42 @@ func (s *service) status() (*Status, error) {
 		VMS:                 []hvms{},
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), s.scrapeTimeout*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), s.scrapeTimeout)
 	defer cancel()
 	c, err := NewClient(ctx, s.vmwareHost, s.vmwareUser, s.vmwarePassword)
 	if err != nil {
-		s.logger.Error(err.Error())
 		return nil, err
 	}
-	defer c.Logout(ctx)
+	defer func() {
+		// the scrape ctx may already be expired, use a fresh one so the session is always released
+		lctx, lcancel := context.WithTimeout(context.Background(), logoutTimeout)
+		defer lcancel()
+		if err := c.Logout(lctx); err != nil {
+			s.logger.Error(fmt.Sprintf("logout from %s failed: %v", s.vmwareHost, err))
+		}
+	}()
 	m := view.NewManager(c.Client)
-	v, err := m.CreateContainerView(ctx, c.ServiceContent.RootFolder, []string{"HostSystem"}, true)
-	if err != nil {
-		s.logger.Error(err.Error())
-	}
-	defer v.Destroy(ctx)
+
 	var hss []mo.HostSystem
-	err = v.Retrieve(ctx, []string{"HostSystem"}, []string{"summary"}, &hss)
-	if err != nil {
-		s.logger.Error(err.Error())
+	if err := retrieveView(ctx, m, c.ServiceContent.RootFolder, "HostSystem", []string{"summary"}, &hss); err != nil {
+		return nil, fmt.Errorf("retrieve HostSystem: %w", err)
+	}
+	if len(hss) == 0 {
+		return nil, fmt.Errorf("host %s returned no HostSystem objects", s.vmwareHost)
 	}
 
 	finder := find.NewFinder(c.Client)
 	hs, err := finder.DefaultHostSystem(ctx)
 	if err != nil {
-		s.logger.Error(err.Error())
+		return nil, fmt.Errorf("find default host system: %w", err)
 	}
 	ss, err := hs.ConfigManager().StorageSystem(ctx)
 	if err != nil {
-		s.logger.Error(err.Error())
+		return nil, fmt.Errorf("get storage system: %w", err)
 	}
 	var hostss mo.HostStorageSystem
-	err = ss.Properties(ctx, ss.Reference(), nil, &hostss)
-	if err != nil {
-		s.logger.Error(err.Error())
+	if err := ss.Properties(ctx, ss.Reference(), nil, &hostss); err != nil {
+		return nil, fmt.Errorf("get storage system properties: %w", err)
 	}
 
 	if len(hostss.StorageDeviceInfo.ScsiLun) > 0 {
@@ -135,12 +160,11 @@ func (s *service) status() (*Status, error) {
 
 	nn, err := hs.ConfigManager().NetworkSystem(ctx)
 	if err != nil {
-		s.logger.Error(err.Error())
+		return nil, fmt.Errorf("get network system: %w", err)
 	}
 	var hostsn mo.HostNetworkSystem
-	err = nn.Properties(ctx, nn.Reference(), nil, &hostsn)
-	if err != nil {
-		s.logger.Error(err.Error())
+	if err := nn.Properties(ctx, nn.Reference(), nil, &hostsn); err != nil {
+		return nil, fmt.Errorf("get network system properties: %w", err)
 	}
 	for _, ni := range hostsn.NetworkInfo.Pnic {
 		var lSpeed float64
@@ -152,39 +176,30 @@ func (s *service) status() (*Status, error) {
 	}
 
 	// Datastore Metrics
-	v, err = m.CreateContainerView(ctx, c.ServiceContent.RootFolder, []string{"Datastore"}, true)
-	if err != nil {
-		s.logger.Fatal(err.Error())
-	}
-	defer v.Destroy(ctx)
 	var dss []mo.Datastore
-	err = v.Retrieve(ctx, []string{"Datastore"}, []string{"summary"}, &dss)
-	if err != nil {
-		s.logger.Error(err.Error())
+	if err := retrieveView(ctx, m, c.ServiceContent.RootFolder, "Datastore", []string{"summary"}, &dss); err != nil {
+		return nil, fmt.Errorf("retrieve Datastore: %w", err)
 	}
 	for _, ds := range dss {
 		status.DS = append(status.DS, totalds{ds.Summary.Name, float64(ds.Summary.Capacity), float64(ds.Summary.FreeSpace)})
 	}
 
 	// Guest VM Metrics
-
-	v, err = m.CreateContainerView(ctx, c.ServiceContent.RootFolder, []string{"VirtualMachine"}, true)
-	if err != nil {
-		s.logger.Fatal(err.Error())
-	}
-	defer v.Destroy(ctx)
 	var vms []mo.VirtualMachine
-	err = v.Retrieve(ctx, []string{"VirtualMachine"}, nil, &vms)
-	if err != nil {
-		s.logger.Error(err.Error())
+	if err := retrieveView(ctx, m, c.ServiceContent.RootFolder, "VirtualMachine", nil, &vms); err != nil {
+		return nil, fmt.Errorf("retrieve VirtualMachine: %w", err)
 	}
 
-	vmsRefs, err := v.Find(ctx, []string{"VirtualMachine"}, nil)
-	if err != nil {
-		s.logger.Fatal(err.Error())
+	vmsRefs := make([]types.ManagedObjectReference, 0, len(vms))
+	for _, vm := range vms {
+		vmsRefs = append(vmsRefs, vm.Self)
 	}
 
-	vmPerfMetrics := perfMon(ctx, c, s.logger, vmsRefs)
+	// perf counters are optional: a failure must not drop all the other metrics
+	vmPerfMetrics, err := perfMon(ctx, c, vmsRefs)
+	if err != nil {
+		s.logger.Error(fmt.Sprintf("collect VM performance metrics from %s failed: %v", s.vmwareHost, err))
+	}
 
 	for _, vm := range vms {
 		vmNum := vm.GetManagedEntity().Self.Value
@@ -387,7 +402,7 @@ func (s *service) status() (*Status, error) {
 		for _, sensor := range hss[0].Summary.Runtime.HealthSystemRuntime.SystemHealthInfo.NumericSensorInfo {
 			status.SensorInfo = append(status.SensorInfo, NumericSensorInfo{
 				Name:           sensor.Name,
-				HealthState:    sensorHealth(strings.ToLower(sensor.HealthState.GetElementDescription().Key)),
+				HealthState:    sensorHealthOf(sensor.HealthState),
 				CurrentReading: strconv.Itoa(int(float64(sensor.CurrentReading) * math.Pow(10, float64(sensor.UnitModifier)))),
 				BaseUnits:      sensor.BaseUnits,
 				SensorType:     sensor.SensorType,
@@ -402,7 +417,7 @@ func (s *service) status() (*Status, error) {
 			if !checkSensorIfAppend(storageSensor.Name, status.StorageInfo) {
 				status.StorageInfo = append(status.StorageInfo, StorageStateInfo{
 					Name:   storageSensor.Name,
-					Status: sensorHealth(strings.ToLower(storageSensor.Status.GetElementDescription().Key)),
+					Status: sensorHealthOf(storageSensor.Status),
 				})
 			}
 		}
@@ -411,7 +426,9 @@ func (s *service) status() (*Status, error) {
 	status.HostName = hss[0].Summary.Config.Name
 	status.HostPowerState = powerState(hss[0].Summary.Runtime.PowerState)
 	status.HostMaintenanceMode = maintenanceMode(hss[0].Summary.Runtime.InMaintenanceMode)
-	status.HostBoot = float64(hss[0].Summary.Runtime.BootTime.Unix())
+	if bt := hss[0].Summary.Runtime.BootTime; bt != nil {
+		status.HostBoot = float64(bt.Unix())
+	}
 	status.TotalCpu = totalCpu(hss[0])
 	status.UsageCpu = float64(hss[0].Summary.QuickStats.OverallCpuUsage)
 	status.TotalMem = float64(hss[0].Summary.Hardware.MemorySize)
@@ -437,6 +454,21 @@ func (s *service) status() (*Status, error) {
 	status.Product.LicenseVersion = hss[0].Summary.Config.Product.LicenseProductVersion
 
 	return &status, nil
+}
+
+// retrieveView loads properties of all objects of the given type and always destroys the view,
+// even when the scrape context is already expired.
+func retrieveView(ctx context.Context, m *view.Manager, root types.ManagedObjectReference, kind string, props []string, dst interface{}) error {
+	v, err := m.CreateContainerView(ctx, root, []string{kind}, true)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		dctx, cancel := context.WithTimeout(context.Background(), logoutTimeout)
+		defer cancel()
+		_ = v.Destroy(dctx)
+	}()
+	return v.Retrieve(ctx, []string{kind}, props, dst)
 }
 
 func checkSensorIfAppend(name string, sensors []StorageStateInfo) bool {

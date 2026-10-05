@@ -2,11 +2,12 @@ package vmware
 
 import (
 	"context"
+	"fmt"
 	"github.com/vmware/govmomi"
 	"github.com/vmware/govmomi/performance"
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
-	"vmware-exporter/pkg/logging"
+	"strings"
 )
 
 type vmMetric struct {
@@ -54,6 +55,14 @@ func sensorHealth(s string) float64 {
 	return 0
 }
 
+// sensorHealthOf is nil-safe: hosts may omit the health state of a sensor.
+func sensorHealthOf(s types.BaseElementDescription) float64 {
+	if s == nil {
+		return 0
+	}
+	return sensorHealth(strings.ToLower(s.GetElementDescription().Key))
+}
+
 func powerStateVM(s types.VirtualMachinePowerState) float64 {
 	if s == "poweredOn" {
 		return 1
@@ -89,10 +98,11 @@ func maintenanceMode(s bool) float64 {
 	return 0
 }
 
-func perfMon(ctx context.Context, c *govmomi.Client, l *logging.Logger, vms []types.ManagedObjectReference) map[string][]vmMetric {
-
-	var perfMetricsResult []vmMetric
-	metricsRes := make(map[string][]vmMetric)
+// perfMon returns performance counters per VM (key is the VM managed object id).
+func perfMon(ctx context.Context, c *govmomi.Client, vms []types.ManagedObjectReference) (map[string][]vmMetric, error) {
+	if len(vms) == 0 {
+		return nil, nil
+	}
 
 	// Create a PerfManager
 	perfManager := performance.NewManager(c.Client)
@@ -100,10 +110,10 @@ func perfMon(ctx context.Context, c *govmomi.Client, l *logging.Logger, vms []ty
 	// Retrieve counters name list
 	counters, err := perfManager.CounterInfoByName(ctx)
 	if err != nil {
-		l.Fatal(err.Error())
+		return nil, fmt.Errorf("counter info: %w", err)
 	}
 
-	var names []string
+	names := make([]string, 0, len(counters))
 	for name := range counters {
 		names = append(names, name)
 	}
@@ -116,46 +126,39 @@ func perfMon(ctx context.Context, c *govmomi.Client, l *logging.Logger, vms []ty
 	}
 
 	// Query metrics
-	if vms != nil {
-		sample, err := perfManager.SampleByName(ctx, spec, names, vms)
-		if err != nil {
-			l.Fatal(err.Error())
-		}
-
-		result, err := perfManager.ToMetricSeries(ctx, sample)
-		if err != nil {
-			l.Fatal(err.Error())
-		}
-
-		// Read result
-		for _, metric := range result {
-			vmNum := metric.Entity.Value
-			for _, v := range metric.Value {
-				counter := counters[v.Name]
-				units := counter.UnitInfo.GetElementDescription().Label
-
-				instance := v.Instance
-				if instance == "" {
-					instance = "-"
-				}
-
-				if len(v.Value) != 0 {
-					metric := vmMetric{
-						Instance:    instance,
-						MetricName:  v.Name,
-						MetricValue: v.ValueCSV(),
-						MetricUnit:  units,
-					}
-					perfMetricsResult = append(perfMetricsResult, metric)
-				}
-			}
-
-			metricsRes[vmNum] = perfMetricsResult
-
-		}
-		return metricsRes
+	sample, err := perfManager.SampleByName(ctx, spec, names, vms)
+	if err != nil {
+		return nil, fmt.Errorf("sample: %w", err)
 	}
 
-	return nil
+	result, err := perfManager.ToMetricSeries(ctx, sample)
+	if err != nil {
+		return nil, fmt.Errorf("metric series: %w", err)
+	}
 
+	metricsRes := make(map[string][]vmMetric)
+	for _, metric := range result {
+		var vmMetrics []vmMetric
+		for _, v := range metric.Value {
+			if len(v.Value) == 0 {
+				continue
+			}
+			instance := v.Instance
+			if instance == "" {
+				instance = "-"
+			}
+			var unit string
+			if ci, ok := counters[v.Name]; ok && ci.UnitInfo != nil {
+				unit = ci.UnitInfo.GetElementDescription().Label
+			}
+			vmMetrics = append(vmMetrics, vmMetric{
+				Instance:    instance,
+				MetricName:  v.Name,
+				MetricValue: v.ValueCSV(),
+				MetricUnit:  unit,
+			})
+		}
+		metricsRes[metric.Entity.Value] = vmMetrics
+	}
+	return metricsRes, nil
 }
